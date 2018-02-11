@@ -11,20 +11,26 @@ import (
 	"log"
 	"math"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
+	"time"
 
-	"github.com/awgh/bencrypt/bc"
 	"github.com/awgh/bencrypt/ecc"
+	"github.com/awgh/ratnet/api"
 	"github.com/awgh/ratnet/nodes/qldb"
 	"github.com/awgh/ratnet/policy"
-	"github.com/awgh/ratnet/transports/udp"
+	"github.com/awgh/ratnet/router"
+	"github.com/awgh/ratnet/transports/https"
 )
 
 const (
-	hdrMagic      uint32 = 0xF113
-	chunkMagic    uint32 = 0xF114
-	chunksize     uint32 = 49007
+	hdrMagic   uint32 = 0xF113
+	chunkMagic uint32 = 0xF114
+	//chunksize     uint32 = 49007 // this is for base64-encoding in the db (QL limits recordsize)
+	chunksize     uint32 = 65432 // for raw binary in the db (QL limits recordsize)
 	hdrsize       uint32 = 279
 	chunkHdrSize  uint32 = 12
 	chunkDataSize uint32 = chunksize - chunkHdrSize
@@ -33,7 +39,8 @@ const (
 // WARNING DANGER TODO FAKE CODE!!!
 // PROGRAM IS NOT SAFE TO USE UNTIL THESE KEYS ARE REPLACED!!!
 var pubprivkeyb64Ecc = "Tcksa18txiwMEocq7NXdeMwz6PPBD+nxCjb/WCtxq1+dln3M3IaOmg+YfTIbBpk+jIbZZZiT+4CoeFzaJGEWmg=="
-var pubkeyb64Ecc = "Tcksa18txiwMEocq7NXdeMwz6PPBD+nxCjb/WCtxq18="
+
+//var pubkeyb64Ecc = "Tcksa18txiwMEocq7NXdeMwz6PPBD+nxCjb/WCtxq18="
 
 // Header manifest for a file transfer
 type Header struct {
@@ -43,6 +50,10 @@ type Header struct {
 	NumChunks uint32
 	Filename  string
 }
+
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
+var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
+var logfile = flag.String("logfile", "", "write logs to `file`")
 
 func main() {
 	var dbFile, rxDir, txDir, tmpDir string
@@ -56,6 +67,58 @@ func main() {
 	//flag.StringVar(&sentDir, "sentdir", "sent", "Completed Uploads Directory")
 	flag.Parse()
 
+	var f *os.File
+	if *logfile != "" {
+		// Config default logger
+		var err error
+		log.SetFlags(log.Lshortfile | log.Lmicroseconds)
+		f, err = os.OpenFile(*logfile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+		if err != nil {
+			log.Fatalf("error opening logfile: %v", err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+	}
+	// CPU profiling support
+	if *cpuprofile != "" {
+		cf, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(cf)
+		defer pprof.StopCPUProfile()
+	}
+
+	// capture ctrl+c and stop CPU profiler
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for sig := range c {
+			log.Printf("captured %v, stopping profiler and exiting..", sig)
+
+			// Memory profiling support
+			if *memprofile != "" {
+				mf, err := os.Create(*memprofile)
+				if err != nil {
+					log.Fatal("could not create memory profile: ", err)
+				}
+				runtime.GC() // get up-to-date statistics
+				if err := pprof.WriteHeapProfile(mf); err != nil {
+					log.Fatal("could not write memory profile: ", err)
+				}
+				mf.Close()
+			}
+			//
+			if *cpuprofile != "" {
+				pprof.StopCPUProfile()
+			}
+			if *logfile != "" {
+				f.Close()
+			}
+			os.Exit(1)
+		}
+	}()
+
 	listenPublic := fmt.Sprintf(":%d", publicPort)
 
 	// QLDB Node Mode
@@ -67,15 +130,26 @@ func main() {
 		log.Fatal(err.Error())
 	}
 
-	transportPublic := udp.New(node)
+	router := router.NewDefaultRouter()
+	router.ForwardConsumedChannels = false
+	node.SetRouter(router)
+	//
 
-	node.SetPolicy(
-		policy.NewP2P(transportPublic, listenPublic, node, false))
+	transportPublic := https.New("cert.pem", "key.pem", node, true)
+	//transportPublic := udp.New(node)
+
+	p2p := policy.NewP2P(transportPublic, listenPublic, node, false, 250, 30000)
+	node.SetPolicy(p2p)
 	log.Println("Public Server starting: ", listenPublic)
 
 	node.FlushOutbox(0)
-	node.Start()
+	if err := node.Start(); err != nil {
+		log.Fatal("node didn't start: " + err.Error())
+	}
 
+	go handlerLoop(node, txDir, rxDir, tmpDir)
+
+	var streamID uint32
 	files, _ := ioutil.ReadDir(txDir)
 	for _, f := range files {
 		filename := filepath.Join(txDir, f.Name())
@@ -92,9 +166,6 @@ func main() {
 		numChunks := uint32(numChunks64)
 		log.Println("Sending Header with ", numChunks, " chunks")
 
-		rnd, _ := bc.GenerateRandomBytes(4)
-		streamID := binary.LittleEndian.Uint32(rnd)
-
 		hdr := make([]byte, hdrsize)
 		binary.LittleEndian.PutUint32(hdr, hdrMagic)
 		binary.LittleEndian.PutUint32(hdr[4:], streamID)
@@ -102,52 +173,114 @@ func main() {
 		binary.LittleEndian.PutUint32(hdr[16:], chunksize)
 		binary.LittleEndian.PutUint32(hdr[20:], numChunks)
 		copy(hdr[24:], f.Name())
+
 		if err := node.SendChannel("fixme", hdr); err != nil {
-			log.Println(err.Error())
-			continue
+			log.Fatal(err.Error())
 		}
 
 		inputFile, err := os.Open(filename)
-		defer inputFile.Close()
-
 		if err != nil {
 			log.Println(err.Error())
 			continue
 		}
-		var i uint32
-		for i = 0; i < numChunks; i++ {
+		var n int
+		var batchSize uint32 = 100
+		chunkBatch := make([][]byte, batchSize)
+		for x := range chunkBatch {
+			chunkBatch[x] = make([]byte, chunksize)
+		}
+		chunksInBatch := 0
+
+		for i := uint32(0); i < numChunks-1; i++ {
 			chunk := make([]byte, chunksize)
 			binary.LittleEndian.PutUint32(chunk, chunkMagic)
 			binary.LittleEndian.PutUint32(chunk[4:], streamID)
 			binary.LittleEndian.PutUint32(chunk[8:], i)
 
-			n, err := inputFile.ReadAt(chunk[12:], int64(chunkDataSize)*int64(i))
-			if (i != numChunks-1 && n != int(chunkDataSize)) || (err != nil && err != io.EOF) {
-				log.Println("Chunk could not be read, n=", n, ", i=", i, " ", err.Error())
-				break
+			n, err = inputFile.ReadAt(chunk[12:], int64(chunkDataSize)*int64(i))
+			if err == io.EOF {
+				log.Fatal("EOF too early, code is broken")
 			}
-			log.Println("read ", n, " bytes.  sent ", len(chunk))
-			if n > 0 {
-				err = node.SendChannel("fixme", chunk[:int(chunkHdrSize)+n])
-				if err != nil && err != io.EOF {
-					log.Println(err)
-					break
+			if n != int(chunkDataSize) || err != nil {
+				log.Fatalf("chunk read underflow: n=%d , i= %d, err=%+v\n", n, i, err.Error())
+			}
+			log.Printf("xxx %d %d\n", i, n)
+			chunkBatch[i%batchSize] = chunk[:] // chunksize
+			chunksInBatch++
+
+			if i%batchSize == batchSize-1 { // last chunk in batch (i is 0-indexed, numChunks is 1-indexed)
+				if erra := node.SendChannelBulk("fixme", chunkBatch); erra != nil {
+					log.Fatal(erra.Error())
+				}
+				log.Printf("bulk sent: %d messages\n", len(chunkBatch))
+				chunkBatch = nil // reset chunkBatch
+				chunkBatch = make([][]byte, batchSize)
+				for x := range chunkBatch {
+					chunkBatch[x] = make([]byte, chunksize)
+				}
+				chunksInBatch = 0
+			}
+		}
+		log.Printf("at remainder, chunksInBatch= %d\n", chunksInBatch)
+		if chunksInBatch > 0 {
+			chunk := make([]byte, chunksize)
+			binary.LittleEndian.PutUint32(chunk, chunkMagic)
+			binary.LittleEndian.PutUint32(chunk[4:], streamID)
+			binary.LittleEndian.PutUint32(chunk[8:], numChunks-1)
+
+			n, err = inputFile.ReadAt(chunk[12:], int64(chunkDataSize)*int64(numChunks-1))
+			if err == io.EOF {
+				log.Printf("EOF in remainder, n=%d\n", n)
+			} else if n == 0 || err != nil {
+				log.Fatalf("chunk remainder error: n=%d , i= %d, err=%+v\n", n, numChunks-1, err.Error())
+			}
+			if n > 0 { // add the last chunk, if there is one
+				log.Printf("xxx %d %d\n", numChunks-1, n)
+				chunkBatch[(numChunks-1)%batchSize] = chunk[:12+n] // chunkHdrSize+n
+				chunksInBatch++
+			}
+			if len(chunkBatch) > 0 { // add any remaining chunks that didn't fill a block
+				err = node.SendChannelBulk("fixme", chunkBatch[:chunksInBatch])
+				if err != nil {
+					log.Fatal(err.Error())
 				}
 			}
 		}
-		if err != nil {
-			log.Println(err.Error())
-		} else {
-			log.Println("Sending complete, deleting " + filename)
+		log.Println("Sending complete, removing file: " + filename)
+		go func() {
 			if err := os.Remove(filename); err != nil {
 				log.Println(err)
 			}
-		}
+		}()
+		_ = inputFile.Close()
+		streamID++
 	}
 	for {
+		runtime.GC()
+		time.Sleep(30 * time.Second)
+
+		//for each stream dir in tmp dir, check for done-ness
+		streamDirs, err := getStreamDirs(tmpDir)
+		if err != nil {
+			log.Println(err)
+		} else {
+			for _, sid := range streamDirs {
+				if isStreamComplete(tmpDir, sid) {
+					completeFile(tmpDir, sid, rxDir)
+				}
+			}
+		}
+	}
+}
+
+func handlerLoop(node api.Node, txDir, rxDir, tmpDir string) {
+	for {
+
+		skipStreams := make(map[uint32]bool) // streamID's for files we've seen
+
 		// read a message from the output channel
 		msg := <-node.Out()
-		log.Println("Receiving stuff!")
+		//log.Println("Receiving stuff!")
 		buf := msg.Content.Bytes()
 		// read and validate the header
 		magic := binary.LittleEndian.Uint32(buf)
@@ -155,6 +288,7 @@ func main() {
 
 		case hdrMagic:
 			// Read Header Fields
+
 			var hdr Header
 			hdr.StreamID = binary.LittleEndian.Uint32(buf[4:])
 			hdr.Filesize = binary.LittleEndian.Uint64(buf[8:])
@@ -165,6 +299,14 @@ func main() {
 			filename = bytes.TrimRight(filename, string([]byte{0}))
 			hdr.Filename = string(filename)
 
+			log.Printf("read header: %v\n", hdr)
+			if _, err := os.Stat(filepath.Join(txDir, hdr.Filename)); err == nil {
+				// todo: this should be based on file hash, not file name
+				// this is a file we're sending
+				skipStreams[hdr.StreamID] = true
+				log.Println("Skipping file we already have")
+				continue
+			}
 			if tmp, err := mkStreamDir(tmpDir, hdr.StreamID); err != nil {
 				log.Println(err)
 			} else {
@@ -179,10 +321,14 @@ func main() {
 				}
 				streamIDtoNumChunks[hdr.StreamID] = hdr.NumChunks // update cache
 			}
-			break
 		case chunkMagic:
 			streamID := binary.LittleEndian.Uint32(buf[4:])
 			chunkID := binary.LittleEndian.Uint32(buf[8:])
+
+			log.Printf("read chunk: %d %d\n", streamID, chunkID)
+			if _, ok := skipStreams[streamID]; ok {
+				continue // we're sending this file, don't receive it
+			}
 			if tmp, err := mkStreamDir(tmpDir, streamID); err != nil {
 				log.Println(err)
 			} else {
@@ -192,15 +338,7 @@ func main() {
 				if err != nil {
 					log.Println(err)
 				}
-				// Are we done?
-				numChunks := chunksForStream(tmpDir, streamID)
-				if numChunks > 0 {
-					if isStreamComplete(tmpDir, streamID, numChunks) {
-						completeFile(tmpDir, streamID, rxDir)
-					}
-				}
 			}
-			break
 		default:
 			log.Println("Magic Doesn't Match!")
 			continue
