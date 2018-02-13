@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -10,9 +11,15 @@ import (
 )
 
 var streamIDtoNumChunks map[uint32]uint32
+var streamIDtoFilename map[uint32]string
 
 func init() {
 	streamIDtoNumChunks = make(map[uint32]uint32) // cache for numChunks by streamID
+	streamIDtoFilename = make(map[uint32]string)
+}
+
+func hex(n uint32) string {
+	return fmt.Sprintf("%08x", n)
 }
 
 func loadManifest(manifest string) *Header {
@@ -39,8 +46,7 @@ func chunksForStream(tmpDir string, streamID uint32) uint32 {
 		return numChunks
 	}
 	// cache miss, check for manifest file
-	manifest := filepath.Join(tmpDir, strconv.FormatUint(uint64(streamID), 16),
-		"manifest.json")
+	manifest := filepath.Join(tmpDir, hex(streamID), "manifest.json")
 
 	//log.Printf("chunksForStream loading manifest: %s\n", manifest)
 	hdr := loadManifest(manifest)
@@ -52,18 +58,33 @@ func chunksForStream(tmpDir string, streamID uint32) uint32 {
 	return 0
 }
 
-func fileCount(path string) int {
-	i := 0
+func fileCount(path string) (int, []uint32) {
 	files, err := ioutil.ReadDir(path)
 	if err != nil {
-		return 0
+		return 0, nil
 	}
+	var i int
+	var retval []uint32
+	lastFound := int64(-1)
 	for _, file := range files {
 		if !file.IsDir() {
-			i++
+			// record gaps
+			x, err := strconv.ParseInt(file.Name(), 16, 64)
+			if err == nil {
+				if i == 0 || lastFound == x-1 {
+					lastFound = x
+				} else {
+					for j := lastFound + 1; j < x; j++ {
+						retval = append(retval, uint32(j))
+						//log.Printf("file missing: %08x\n", j)
+					}
+					lastFound = x
+				}
+				i++
+			}
 		}
 	}
-	return i
+	return i, retval
 }
 
 func getStreamDirs(tmpDir string) ([]uint32, error) {
@@ -74,7 +95,7 @@ func getStreamDirs(tmpDir string) ([]uint32, error) {
 	var retval []uint32
 	for _, file := range files {
 		if file.IsDir() {
-			x, err := strconv.Atoi(file.Name())
+			x, err := strconv.ParseInt(file.Name(), 16, 64)
 			if err == nil {
 				retval = append(retval, uint32(x))
 			}
@@ -85,36 +106,43 @@ func getStreamDirs(tmpDir string) ([]uint32, error) {
 
 func mkStreamDir(tmpDir string, streamID uint32) (string, error) {
 	// Create Directory for File, if not exist
-	tmp := filepath.Join(tmpDir, strconv.FormatUint(uint64(streamID), 16))
+	tmp := filepath.Join(tmpDir, hex(streamID))
 	if _, err := os.Stat(tmp); os.IsNotExist(err) {
 		return tmp, os.Mkdir(tmp, 0700)
 	}
 	return tmp, nil
 }
 
-func isStreamComplete(tmpDir string, streamID uint32) bool {
+func isStreamComplete(tmpDir string, streamID uint32) (bool, []uint32) {
 
 	numChunks := chunksForStream(tmpDir, streamID)
 	if numChunks == 0 {
-		return false // no manifest yet
+		return false, nil // no manifest yet
 	}
-
-	tmp := filepath.Join(tmpDir, strconv.FormatUint(uint64(streamID), 16))
-
+	tmp := filepath.Join(tmpDir, hex(streamID))
 	//log.Printf("isStreamComplete: %s %d == %d\n", tmp, fileCount(tmp)-1, int(numChunks))
 
-	return fileCount(tmp)-1 == int(numChunks) // -1 for the manifest.json file, which is not a chunk
+	n, missing := fileCount(tmp)
+
+	if n+len(missing) == int(numChunks) {
+		if len(missing) == 0 {
+			log.Printf("File complete with %d / %d, %d missing\n", n, numChunks, len(missing))
+			return true, nil
+		} else {
+			log.Printf("stream not complete: %d + %d = %d == %d\n", n, len(missing), n+len(missing), int(numChunks))
+			return false, missing // only ask for resends when the first pass is done
+		}
+	}
+	// not done with first pass, but not ready to ask for resends
+	return false, nil
 }
 
-var totalBytes uint64
-
 func completeFile(tmpDir string, streamID uint32, rxDir string) {
-	tmp := filepath.Join(tmpDir, strconv.FormatUint(uint64(streamID), 16))
+	tmp := filepath.Join(tmpDir, hex(streamID))
 	manifest := filepath.Join(tmp, "manifest.json")
 	hdr := loadManifest(manifest)
 	if hdr != nil && len(hdr.Filename) > 0 && len(hdr.Filename) < 256 {
-		log.Println("completed file, cumulative bytes: " + strconv.FormatUint(totalBytes, 10))
-		totalBytes += hdr.Filesize
+		log.Printf("completed file, bytes: %d\n", hdr.Filesize)
 		// Open the output file
 		outfile, err := os.Create(filepath.Join(rxDir, hdr.Filename))
 		defer outfile.Close()
@@ -125,13 +153,13 @@ func completeFile(tmpDir string, streamID uint32, rxDir string) {
 		// Copy out all the chunks
 		var i uint64
 		for i = 0; i < uint64(hdr.NumChunks); i++ {
-			chunk := filepath.Join(tmp, strconv.FormatUint(i, 16))
+			chunk := filepath.Join(tmp, hex(uint32(i)))
 			b, err := ioutil.ReadFile(chunk)
 			if err != nil {
 				log.Println(err) // this will get hit if a file is missing
 				return
 			}
-			outfile.Write(b)
+			outfile.Write(b) // todo: check n and error here for full fs, delete chunks as you go for low space
 		}
 		_, ok := streamIDtoNumChunks[streamID]
 		if ok {
@@ -142,26 +170,3 @@ func completeFile(tmpDir string, streamID uint32, rxDir string) {
 		}
 	}
 }
-
-/*
-func completeFile(tmpDir string, streamID uint32, rxDir string) {
-	tmp := filepath.Join(tmpDir, strconv.FormatUint(uint64(streamID), 16))
-	manifest := filepath.Join(tmp, "manifest.json")
-
-	//log.Printf("completeFile loading manifest: %s\n", manifest)
-	hdr := loadManifest(manifest)
-	//log.Printf("completeFile loaded manifest: %v\n", hdr)
-
-	if hdr != nil && len(hdr.Filename) > 0 && len(hdr.Filename) < 256 {
-		log.Println("completed file, cumulative bytes: " + strconv.FormatUint(totalBytes, 10))
-		totalBytes += hdr.Filesize
-		_, ok := streamIDtoNumChunks[streamID]
-		if ok {
-			delete(streamIDtoNumChunks, streamID)
-		}
-		if err := os.RemoveAll(tmp); err != nil {
-			log.Println("removing stream tmp dir failed: " + tmp)
-		}
-	}
-}
-*/

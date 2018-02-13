@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -15,22 +16,22 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
-	"strconv"
 	"time"
 
 	"github.com/awgh/bencrypt/ecc"
-	"github.com/awgh/ratnet/api"
 	"github.com/awgh/ratnet/nodes/qldb"
 	"github.com/awgh/ratnet/policy"
 	"github.com/awgh/ratnet/router"
-	"github.com/awgh/ratnet/transports/https"
+	"github.com/awgh/ratnet/transports/udp"
 )
 
 const (
-	hdrMagic   uint32 = 0xF113
-	chunkMagic uint32 = 0xF114
+	hdrMagic    uint32 = 0xF113
+	chunkMagic  uint32 = 0xF114
+	resendMagic uint32 = 0xF115
 	//chunksize     uint32 = 49007 // this is for base64-encoding in the db (QL limits recordsize)
-	chunksize     uint32 = 65432 // for raw binary in the db (QL limits recordsize)
+	//chunksize     uint32 = 65432 // for raw binary in the db (QL limits recordsize)
+	chunksize     uint32 = 64 * 1024
 	hdrsize       uint32 = 279
 	chunkHdrSize  uint32 = 12
 	chunkDataSize uint32 = chunksize - chunkHdrSize
@@ -51,9 +52,18 @@ type Header struct {
 	Filename  string
 }
 
+type RequestResend struct {
+	StreamID uint32
+	Chunks   []uint32
+}
+
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
 var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
 var logfile = flag.String("logfile", "", "write logs to `file`")
+
+func init() {
+	gob.Register(&RequestResend{})
+}
 
 func main() {
 	var dbFile, rxDir, txDir, tmpDir string
@@ -135,10 +145,13 @@ func main() {
 	node.SetRouter(router)
 	//
 
-	transportPublic := https.New("cert.pem", "key.pem", node, true)
-	//transportPublic := udp.New(node)
+	//transportPublic := https.New("cert.pem", "key.pem", node, true)
+	transportPublic := udp.New(node)
+	//transportPublic.SetByteLimit(10000 * 1024) // todo this doesn't change the value in the global map
 
-	p2p := policy.NewP2P(transportPublic, listenPublic, node, false, 250, 30000)
+	//transportPublic := tls.New("cert.pem", "key.pem", node, true)
+
+	p2p := policy.NewP2P(transportPublic, listenPublic, node, false, 50, 30000)
 	node.SetPolicy(p2p)
 	log.Println("Public Server starting: ", listenPublic)
 
@@ -149,11 +162,15 @@ func main() {
 
 	go handlerLoop(node, txDir, rxDir, tmpDir)
 
+	log.Printf("transport byte limit set to: %d\n", transportPublic.ByteLimit())
+
 	var streamID uint32
 	files, _ := ioutil.ReadDir(txDir)
 	for _, f := range files {
 		filename := filepath.Join(txDir, f.Name())
 		log.Println("Sending ", filename, " with size ", f.Size())
+
+		streamIDtoFilename[streamID] = f.Name()
 
 		numChunks64 := f.Size() / int64(chunkDataSize)
 		if f.Size()%int64(chunkDataSize) != 0 {
@@ -246,18 +263,20 @@ func main() {
 				}
 			}
 		}
-		log.Println("Sending complete, removing file: " + filename)
-		go func() {
-			if err := os.Remove(filename); err != nil {
-				log.Println(err)
-			}
-		}()
-		_ = inputFile.Close()
+		log.Println("Sending complete: " + filename)
+		/*
+			go func() {
+				if err := os.Remove(filename); err != nil {
+					log.Println(err)
+				}
+			}()
+		*/
+		defer inputFile.Close()
 		streamID++
 	}
 	for {
 		runtime.GC()
-		time.Sleep(30 * time.Second)
+		time.Sleep(90 * time.Second)
 
 		//for each stream dir in tmp dir, check for done-ness
 		streamDirs, err := getStreamDirs(tmpDir)
@@ -265,15 +284,30 @@ func main() {
 			log.Println(err)
 		} else {
 			for _, sid := range streamDirs {
-				if isStreamComplete(tmpDir, sid) {
+				done, missing := isStreamComplete(tmpDir, sid)
+				if done {
 					completeFile(tmpDir, sid, rxDir)
+				} else if len(missing) > 0 {
+					// request missing pieces
+					rr := &RequestResend{StreamID: sid, Chunks: missing}
+
+					magic := make([]byte, 4)
+					binary.LittleEndian.PutUint32(magic, resendMagic)
+					//use default gob encoder
+					var buf bytes.Buffer
+					enc := gob.NewEncoder(&buf)
+					if err := enc.Encode(rr); err != nil {
+						log.Println("resend request TX gob encode failed: " + err.Error())
+					} else {
+						node.SendChannel("fixme", append(magic, buf.Bytes()...))
+					}
 				}
 			}
 		}
 	}
 }
 
-func handlerLoop(node api.Node, txDir, rxDir, tmpDir string) {
+func handlerLoop(node *qldb.Node, txDir, rxDir, tmpDir string) {
 	for {
 
 		skipStreams := make(map[uint32]bool) // streamID's for files we've seen
@@ -333,12 +367,65 @@ func handlerLoop(node api.Node, txDir, rxDir, tmpDir string) {
 				log.Println(err)
 			} else {
 				// Write Chunk File
-				chunkFile := filepath.Join(tmp, strconv.FormatUint(uint64(chunkID), 16))
+				chunkFile := filepath.Join(tmp, hex(chunkID))
 				err = ioutil.WriteFile(chunkFile, buf[12:], 0600)
 				if err != nil {
 					log.Println(err)
 				}
 			}
+		case resendMagic:
+			var rr RequestResend
+			b := bytes.NewBuffer(buf[4:])
+			dec := gob.NewDecoder(b)
+			if err := dec.Decode(&rr); err != nil {
+				log.Println("resend request RX gob decode failed: " + err.Error())
+				return
+			}
+
+			log.Printf("Got Resend Request: %+v\n", rr)
+
+			v, ok := streamIDtoFilename[rr.StreamID]
+			if !ok {
+				log.Printf("Invalid stream ID in resend request: %08x\n", rr.StreamID)
+				continue
+			}
+			filename := filepath.Join(txDir, v)
+			inputFile, err := os.Open(filename)
+			if err != nil {
+				log.Println(err.Error())
+				continue
+			}
+
+			chunkBatch := make([][]byte, len(rr.Chunks))
+			for x := range chunkBatch {
+				chunkBatch[x] = make([]byte, chunksize)
+			}
+			chunksInBatch := 0
+			for i := range rr.Chunks {
+				chunk := make([]byte, chunksize)
+				binary.LittleEndian.PutUint32(chunk, chunkMagic)
+				binary.LittleEndian.PutUint32(chunk[4:], rr.StreamID)
+				binary.LittleEndian.PutUint32(chunk[8:], rr.Chunks[i])
+
+				n, err := inputFile.ReadAt(chunk[12:], int64(chunkDataSize)*int64(rr.Chunks[i]))
+				if err == io.EOF {
+					log.Printf("EOF in Resend, n=%d\n", n)
+				} else if n == 0 || err != nil {
+					log.Fatalf("chunk resend error: n=%d , i= %d, err=%+v\n", n, rr.Chunks[i], err.Error())
+				}
+				if n > 0 {
+					log.Printf("xxx %d %d\n", rr.Chunks[i], n)
+					chunkBatch[i] = chunk[:12+n] // chunkHdrSize+n
+					chunksInBatch++
+				}
+			}
+			if len(chunkBatch) > 0 {
+				err = node.SendChannelBulk("fixme", chunkBatch[:chunksInBatch])
+				if err != nil {
+					log.Fatal(err.Error())
+				}
+			}
+
 		default:
 			log.Println("Magic Doesn't Match!")
 			continue
