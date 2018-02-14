@@ -58,14 +58,14 @@ func chunksForStream(tmpDir string, streamID uint32) uint32 {
 	return 0
 }
 
-func fileCount(path string) (int, []uint32) {
+func fileCount(path string, numChunks uint32) (int, []uint32) {
 	files, err := ioutil.ReadDir(path)
 	if err != nil {
 		return 0, nil
 	}
 	var i int
 	var retval []uint32
-	lastFound := int64(-1)
+	var lastFound int64
 	for _, file := range files {
 		if !file.IsDir() {
 			// record gaps
@@ -83,6 +83,10 @@ func fileCount(path string) (int, []uint32) {
 				i++
 			}
 		}
+	}
+	// if only the last file is missing, the above loop won't notice
+	if lastFound == int64(numChunks)-2 { // -1 for 1-index(numChunks) to 0-index(lastFound) and -1 for the next-to-last item
+		retval = append(retval, numChunks-1)
 	}
 	return i, retval
 }
@@ -117,12 +121,13 @@ func isStreamComplete(tmpDir string, streamID uint32) (bool, []uint32) {
 
 	numChunks := chunksForStream(tmpDir, streamID)
 	if numChunks == 0 {
+		log.Println("isStreamComplete: no manifest yet")
 		return false, nil // no manifest yet
 	}
 	tmp := filepath.Join(tmpDir, hex(streamID))
 	//log.Printf("isStreamComplete: %s %d == %d\n", tmp, fileCount(tmp)-1, int(numChunks))
 
-	n, missing := fileCount(tmp)
+	n, missing := fileCount(tmp, numChunks)
 
 	if n+len(missing) == int(numChunks) {
 		if len(missing) == 0 {
@@ -134,6 +139,7 @@ func isStreamComplete(tmpDir string, streamID uint32) (bool, []uint32) {
 		}
 	}
 	// not done with first pass, but not ready to ask for resends
+	log.Printf("isStreamComplete: %d + %d = %d == %d\n", n, len(missing), n+len(missing), int(numChunks))
 	return false, nil
 }
 

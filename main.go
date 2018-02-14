@@ -19,9 +19,12 @@ import (
 	"time"
 
 	"github.com/awgh/bencrypt/ecc"
+	"github.com/awgh/ratnet/api"
 	"github.com/awgh/ratnet/nodes/qldb"
 	"github.com/awgh/ratnet/policy"
 	"github.com/awgh/ratnet/router"
+	"github.com/awgh/ratnet/transports/https"
+	"github.com/awgh/ratnet/transports/tls"
 	"github.com/awgh/ratnet/transports/udp"
 )
 
@@ -66,16 +69,23 @@ func init() {
 }
 
 func main() {
-	var dbFile, rxDir, txDir, tmpDir string
+	var dbFile, rxDir, txDir, tmpDir, proto string
 	var publicPort int
 
 	flag.StringVar(&dbFile, "dbfile", "ratnet.ql", "QL Database File")
-	flag.IntVar(&publicPort, "p", 20001, "UDP Public Port (*)")
+	flag.StringVar(&proto, "t", "udp", "Transport Protocol (udp|tls|https)")
+	flag.IntVar(&publicPort, "p", 20001, "Public Listening Port (*)")
 	flag.StringVar(&rxDir, "rxdir", "inbox", "Download Directory")
 	flag.StringVar(&txDir, "txdir", "outbox", "Upload Directory")
 	flag.StringVar(&tmpDir, "tempdir", "/tmp", "Temp File Directory")
+
 	//flag.StringVar(&sentDir, "sentdir", "sent", "Completed Uploads Directory")
 	flag.Parse()
+
+	if proto != "udp" && proto != "tls" && proto != "https" {
+		log.Println("Invalid protocol, options are: udp, tls, https")
+		os.Exit(1)
+	}
 
 	var f *os.File
 	if *logfile != "" {
@@ -145,11 +155,16 @@ func main() {
 	node.SetRouter(router)
 	//
 
-	//transportPublic := https.New("cert.pem", "key.pem", node, true)
-	transportPublic := udp.New(node)
+	var transportPublic api.Transport
+	switch proto {
+	case "udp":
+		transportPublic = udp.New(node)
+	case "tls":
+		transportPublic = tls.New("cert.pem", "key.pem", node, true)
+	case "https":
+		transportPublic = https.New("cert.pem", "key.pem", node, true)
+	}
 	//transportPublic.SetByteLimit(10000 * 1024) // todo this doesn't change the value in the global map
-
-	//transportPublic := tls.New("cert.pem", "key.pem", node, true)
 
 	p2p := policy.NewP2P(transportPublic, listenPublic, node, false, 50, 30000)
 	node.SetPolicy(p2p)
@@ -276,7 +291,7 @@ func main() {
 	}
 	for {
 		runtime.GC()
-		time.Sleep(90 * time.Second)
+		time.Sleep(15 * time.Second)
 
 		//for each stream dir in tmp dir, check for done-ness
 		streamDirs, err := getStreamDirs(tmpDir)
