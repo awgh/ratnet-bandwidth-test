@@ -117,12 +117,13 @@ func mkStreamDir(tmpDir string, streamID uint32) (string, error) {
 	return tmp, nil
 }
 
-func isStreamComplete(tmpDir string, streamID uint32) (bool, []uint32) {
+// returns StreamComplete, UseMissing, and Missing
+func isStreamComplete(tmpDir string, streamID uint32) (bool, bool, []uint32) {
 
 	numChunks := chunksForStream(tmpDir, streamID)
 	if numChunks == 0 {
 		log.Println("isStreamComplete: no manifest yet")
-		return false, nil // no manifest yet
+		return false, false, nil // no manifest yet
 	}
 	tmp := filepath.Join(tmpDir, hex(streamID))
 	//log.Printf("isStreamComplete: %s %d == %d\n", tmp, fileCount(tmp)-1, int(numChunks))
@@ -132,15 +133,15 @@ func isStreamComplete(tmpDir string, streamID uint32) (bool, []uint32) {
 	if n+len(missing) == int(numChunks) {
 		if len(missing) == 0 {
 			log.Printf("File complete with %d / %d, %d missing\n", n, numChunks, len(missing))
-			return true, nil
+			return true, false, nil
 		} else {
 			log.Printf("stream not complete: %d + %d = %d == %d\n", n, len(missing), n+len(missing), int(numChunks))
-			return false, missing // only ask for resends when the first pass is done
+			return false, true, missing // only ask for resends when the first pass is done
 		}
 	}
 	// not done with first pass, but not ready to ask for resends
 	log.Printf("isStreamComplete: %d + %d = %d == %d\n", n, len(missing), n+len(missing), int(numChunks))
-	return false, nil
+	return false, false, nil
 }
 
 func completeFile(tmpDir string, streamID uint32, rxDir string) {

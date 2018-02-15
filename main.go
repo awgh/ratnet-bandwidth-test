@@ -291,20 +291,25 @@ func main() {
 	}
 	for {
 		runtime.GC()
-		time.Sleep(15 * time.Second)
+		time.Sleep(1 * time.Second)
 
 		//for each stream dir in tmp dir, check for done-ness
 		streamDirs, err := getStreamDirs(tmpDir)
 		if err != nil {
 			log.Println(err)
 		} else {
+
+			//sidToMissing := make(map[uint32][]byte, 0)
+
 			for _, sid := range streamDirs {
-				done, missing := isStreamComplete(tmpDir, sid)
+				done, useMissing, missing := isStreamComplete(tmpDir, sid)
 				if done {
 					completeFile(tmpDir, sid, rxDir)
-				} else if len(missing) > 0 {
+				} else if useMissing {
 					// request missing pieces
 					rr := &RequestResend{StreamID: sid, Chunks: missing}
+
+					node.FlushOutbox(0) // this is just for the test
 
 					magic := make([]byte, 4)
 					binary.LittleEndian.PutUint32(magic, resendMagic)
@@ -314,9 +319,12 @@ func main() {
 					if err := enc.Encode(rr); err != nil {
 						log.Println("resend request TX gob encode failed: " + err.Error())
 					} else {
+						log.Printf("resend request sent: %+v\n", rr)
 						node.SendChannel("fixme", append(magic, buf.Bytes()...))
 					}
-				}
+				} /* else if !useMissing {
+					bytes.Compare(a, b)
+				} */
 			}
 		}
 	}
