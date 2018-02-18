@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 )
 
 var streamIDtoNumChunks map[uint32]uint32
@@ -117,8 +118,18 @@ func mkStreamDir(tmpDir string, streamID uint32) (string, error) {
 	return tmp, nil
 }
 
+var reentranceFlag int32
+
+// this function uses a mutex which assumes only one thread will be calling it
 // returns StreamComplete, UseMissing, and Missing
 func isStreamComplete(tmpDir string, streamID uint32) (bool, bool, []uint32) {
+
+	if atomic.CompareAndSwapInt32(&reentranceFlag, 0, 1) {
+		defer atomic.StoreInt32(&reentranceFlag, 0)
+	} else {
+		log.Println("isStreamComplete - not reentered")
+		return false, false, nil // this assumes that !done is enough to short-circuit other logic
+	}
 
 	numChunks := chunksForStream(tmpDir, streamID)
 	if numChunks == 0 {

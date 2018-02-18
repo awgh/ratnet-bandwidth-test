@@ -12,15 +12,12 @@ import (
 	"log"
 	"math"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"runtime"
-	"runtime/pprof"
 	"time"
 
 	"github.com/awgh/bencrypt/ecc"
 	"github.com/awgh/ratnet/api"
-	"github.com/awgh/ratnet/nodes/qldb"
+	"github.com/awgh/ratnet/nodes/fs"
 	"github.com/awgh/ratnet/policy"
 	"github.com/awgh/ratnet/router"
 	"github.com/awgh/ratnet/transports/https"
@@ -44,7 +41,7 @@ const (
 // PROGRAM IS NOT SAFE TO USE UNTIL THESE KEYS ARE REPLACED!!!
 var pubprivkeyb64Ecc = "Tcksa18txiwMEocq7NXdeMwz6PPBD+nxCjb/WCtxq1+dln3M3IaOmg+YfTIbBpk+jIbZZZiT+4CoeFzaJGEWmg=="
 
-//var pubkeyb64Ecc = "Tcksa18txiwMEocq7NXdeMwz6PPBD+nxCjb/WCtxq18="
+var pubkeyb64Ecc = "Tcksa18txiwMEocq7NXdeMwz6PPBD+nxCjb/WCtxq18="
 
 // Header manifest for a file transfer
 type Header struct {
@@ -60,8 +57,8 @@ type RequestResend struct {
 	Chunks   []uint32
 }
 
-var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
-var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
+//var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
+//var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
 var logfile = flag.String("logfile", "", "write logs to `file`")
 
 func init() {
@@ -69,10 +66,13 @@ func init() {
 }
 
 func main() {
-	var dbFile, rxDir, txDir, tmpDir, proto string
+	var dbFile, rxDir, txDir, tmpDir, proto, fsDir string
 	var publicPort int
 
 	flag.StringVar(&dbFile, "dbfile", "ratnet.ql", "QL Database File")
+
+	flag.StringVar(&fsDir, "qdir", "queue", "FS Queue Dir")
+
 	flag.StringVar(&proto, "t", "udp", "Transport Protocol (udp|tls|https)")
 	flag.IntVar(&publicPort, "p", 20001, "Public Listening Port (*)")
 	flag.StringVar(&rxDir, "rxdir", "inbox", "Download Directory")
@@ -99,51 +99,62 @@ func main() {
 		defer f.Close()
 		log.SetOutput(f)
 	}
-	// CPU profiling support
-	if *cpuprofile != "" {
-		cf, err := os.Create(*cpuprofile)
-		if err != nil {
-			log.Fatal(err)
+	/*
+		// CPU profiling support
+		if *cpuprofile != "" {
+			cf, err := os.Create(*cpuprofile)
+			if err != nil {
+				log.Fatal(err)
+			}
+			pprof.StartCPUProfile(cf)
+			defer pprof.StopCPUProfile()
 		}
-		pprof.StartCPUProfile(cf)
-		defer pprof.StopCPUProfile()
-	}
 
-	// capture ctrl+c and stop CPU profiler
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	go func() {
-		for sig := range c {
-			log.Printf("captured %v, stopping profiler and exiting..", sig)
+		// capture ctrl+c and stop CPU profiler
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		go func() {
+			for sig := range c {
+				log.Printf("captured %v, stopping profiler and exiting..", sig)
 
-			// Memory profiling support
-			if *memprofile != "" {
-				mf, err := os.Create(*memprofile)
-				if err != nil {
-					log.Fatal("could not create memory profile: ", err)
+				// Memory profiling support
+				if *memprofile != "" {
+					mf, err := os.Create(*memprofile)
+					if err != nil {
+						log.Fatal("could not create memory profile: ", err)
+					}
+					runtime.GC() // get up-to-date statistics
+					if err := pprof.WriteHeapProfile(mf); err != nil {
+						log.Fatal("could not write memory profile: ", err)
+					}
+					mf.Close()
 				}
-				runtime.GC() // get up-to-date statistics
-				if err := pprof.WriteHeapProfile(mf); err != nil {
-					log.Fatal("could not write memory profile: ", err)
+				//
+				if *cpuprofile != "" {
+					pprof.StopCPUProfile()
 				}
-				mf.Close()
+				if *logfile != "" {
+					f.Close()
+				}
+				os.Exit(1)
 			}
-			//
-			if *cpuprofile != "" {
-				pprof.StopCPUProfile()
-			}
-			if *logfile != "" {
-				f.Close()
-			}
-			os.Exit(1)
-		}
-	}()
-
+		}()
+	*/
 	listenPublic := fmt.Sprintf(":%d", publicPort)
 
 	// QLDB Node Mode
-	node := qldb.New(new(ecc.KeyPair), new(ecc.KeyPair))
-	node.BootstrapDB(dbFile)
+	//node := qldb.New(new(ecc.KeyPair), new(ecc.KeyPair))
+	//node.BootstrapDB(dbFile)
+
+	// RAM Node Mode
+	//node := ram.New(new(ecc.KeyPair), new(ecc.KeyPair))
+
+	// FS Node Mode
+	pwd, err := os.Getwd()
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	node := fs.New(new(ecc.KeyPair), new(ecc.KeyPair), filepath.Join(pwd, fsDir))
 
 	// TODO: hardcoded test key because this is TEST PROGRAM until this is fixed.
 	if err := node.AddChannel("fixme", pubprivkeyb64Ecc); err != nil {
@@ -166,7 +177,7 @@ func main() {
 	}
 	//transportPublic.SetByteLimit(10000 * 1024) // todo this doesn't change the value in the global map
 
-	p2p := policy.NewP2P(transportPublic, listenPublic, node, false, 50, 30000)
+	p2p := policy.NewP2P(transportPublic, listenPublic, node, false, 1000, 30000)
 	node.SetPolicy(p2p)
 	log.Println("Public Server starting: ", listenPublic)
 
@@ -216,14 +227,14 @@ func main() {
 			continue
 		}
 		var n int
-		var batchSize uint32 = 100
+		var batchSize uint32 = 2
 		chunkBatch := make([][]byte, batchSize)
 		for x := range chunkBatch {
 			chunkBatch[x] = make([]byte, chunksize)
 		}
 		chunksInBatch := 0
 
-		for i := uint32(0); i < numChunks-1; i++ {
+		for i := uint32(0); i < numChunks; i++ {
 			chunk := make([]byte, chunksize)
 			binary.LittleEndian.PutUint32(chunk, chunkMagic)
 			binary.LittleEndian.PutUint32(chunk[4:], streamID)
@@ -231,13 +242,12 @@ func main() {
 
 			n, err = inputFile.ReadAt(chunk[12:], int64(chunkDataSize)*int64(i))
 			if err == io.EOF {
-				log.Fatal("EOF too early, code is broken")
-			}
-			if n != int(chunkDataSize) || err != nil {
-				log.Fatalf("chunk read underflow: n=%d , i= %d, err=%+v\n", n, i, err.Error())
+				log.Printf("EOF in batch, n=%d\n", n)
+			} else if err != nil {
+				log.Fatalf("chunk read error: n=%d , i= %d, err=%+v\n", n, i, err.Error())
 			}
 			log.Printf("xxx %d %d\n", i, n)
-			chunkBatch[i%batchSize] = chunk[:] // chunksize
+			chunkBatch[i%batchSize] = chunk[:12+n] // chunksize
 			chunksInBatch++
 
 			if i%batchSize == batchSize-1 { // last chunk in batch (i is 0-indexed, numChunks is 1-indexed)
@@ -290,8 +300,8 @@ func main() {
 		streamID++
 	}
 	for {
-		runtime.GC()
-		time.Sleep(1 * time.Second)
+		//runtime.GC()
+		time.Sleep(120 * time.Second)
 
 		//for each stream dir in tmp dir, check for done-ness
 		streamDirs, err := getStreamDirs(tmpDir)
@@ -302,6 +312,7 @@ func main() {
 			//sidToMissing := make(map[uint32][]byte, 0)
 
 			for _, sid := range streamDirs {
+				// currently, isStreamComplete will block
 				done, useMissing, missing := isStreamComplete(tmpDir, sid)
 				if done {
 					completeFile(tmpDir, sid, rxDir)
@@ -309,7 +320,7 @@ func main() {
 					// request missing pieces
 					rr := &RequestResend{StreamID: sid, Chunks: missing}
 
-					node.FlushOutbox(0) // this is just for the test
+					//node.FlushOutbox(0) // this is just for the test
 
 					magic := make([]byte, 4)
 					binary.LittleEndian.PutUint32(magic, resendMagic)
@@ -330,7 +341,9 @@ func main() {
 	}
 }
 
-func handlerLoop(node *qldb.Node, txDir, rxDir, tmpDir string) {
+//func handlerLoop(node *qldb.Node, txDir, rxDir, tmpDir string) {
+
+func handlerLoop(node *fs.Node, txDir, rxDir, tmpDir string) {
 	for {
 
 		skipStreams := make(map[uint32]bool) // streamID's for files we've seen
