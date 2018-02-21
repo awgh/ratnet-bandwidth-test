@@ -175,9 +175,12 @@ func main() {
 	case "https":
 		transportPublic = https.New("cert.pem", "key.pem", node, true)
 	}
+
+	// NOTE: for mipsel32, the optimal byte limit for UDP and TLS were both tested at 250 *1024
+
 	//transportPublic.SetByteLimit(10000 * 1024) // todo this doesn't change the value in the global map
 
-	p2p := policy.NewP2P(transportPublic, listenPublic, node, false, 1000, 30000)
+	p2p := policy.NewP2P(transportPublic, listenPublic, node, false, 5, 30000)
 	node.SetPolicy(p2p)
 	log.Println("Public Server starting: ", listenPublic)
 
