@@ -12,12 +12,15 @@ import (
 	"log"
 	"math"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"time"
 
 	"github.com/awgh/bencrypt/ecc"
 	"github.com/awgh/ratnet/api"
-	"github.com/awgh/ratnet/nodes/fs"
+	"github.com/awgh/ratnet/nodes/qldb"
 	"github.com/awgh/ratnet/policy"
 	"github.com/awgh/ratnet/router"
 	"github.com/awgh/ratnet/transports/https"
@@ -57,8 +60,8 @@ type RequestResend struct {
 	Chunks   []uint32
 }
 
-//var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
-//var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
+var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
 var logfile = flag.String("logfile", "", "write logs to `file`")
 
 func init() {
@@ -70,7 +73,6 @@ func main() {
 	var publicPort int
 
 	flag.StringVar(&dbFile, "dbfile", "ratnet.ql", "QL Database File")
-
 	flag.StringVar(&fsDir, "qdir", "queue", "FS Queue Dir")
 
 	flag.StringVar(&proto, "t", "udp", "Transport Protocol (udp|tls|https)")
@@ -99,62 +101,64 @@ func main() {
 		defer f.Close()
 		log.SetOutput(f)
 	}
-	/*
-		// CPU profiling support
-		if *cpuprofile != "" {
-			cf, err := os.Create(*cpuprofile)
-			if err != nil {
-				log.Fatal(err)
-			}
-			pprof.StartCPUProfile(cf)
-			defer pprof.StopCPUProfile()
+
+	// CPU profiling support
+	if *cpuprofile != "" {
+		cf, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
 		}
+		pprof.StartCPUProfile(cf)
+		defer pprof.StopCPUProfile()
+	}
 
-		// capture ctrl+c and stop CPU profiler
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt)
-		go func() {
-			for sig := range c {
-				log.Printf("captured %v, stopping profiler and exiting..", sig)
+	// capture ctrl+c and stop CPU profiler
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for sig := range c {
+			log.Printf("captured %v, stopping profiler and exiting..", sig)
 
-				// Memory profiling support
-				if *memprofile != "" {
-					mf, err := os.Create(*memprofile)
-					if err != nil {
-						log.Fatal("could not create memory profile: ", err)
-					}
-					runtime.GC() // get up-to-date statistics
-					if err := pprof.WriteHeapProfile(mf); err != nil {
-						log.Fatal("could not write memory profile: ", err)
-					}
-					mf.Close()
+			// Memory profiling support
+			if *memprofile != "" {
+				mf, err := os.Create(*memprofile)
+				if err != nil {
+					log.Fatal("could not create memory profile: ", err)
 				}
-				//
-				if *cpuprofile != "" {
-					pprof.StopCPUProfile()
+				runtime.GC() // get up-to-date statistics
+				if err := pprof.WriteHeapProfile(mf); err != nil {
+					log.Fatal("could not write memory profile: ", err)
 				}
-				if *logfile != "" {
-					f.Close()
-				}
-				os.Exit(1)
+				mf.Close()
 			}
-		}()
-	*/
+			//
+			if *cpuprofile != "" {
+				pprof.StopCPUProfile()
+			}
+			if *logfile != "" {
+				f.Close()
+			}
+			os.Exit(1)
+		}
+	}()
+
 	listenPublic := fmt.Sprintf(":%d", publicPort)
 
 	// QLDB Node Mode
-	//node := qldb.New(new(ecc.KeyPair), new(ecc.KeyPair))
-	//node.BootstrapDB(dbFile)
+	node := qldb.New(new(ecc.KeyPair), new(ecc.KeyPair))
+	node.BootstrapDB(dbFile)
 
 	// RAM Node Mode
 	//node := ram.New(new(ecc.KeyPair), new(ecc.KeyPair))
 
 	// FS Node Mode
-	pwd, err := os.Getwd()
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-	node := fs.New(new(ecc.KeyPair), new(ecc.KeyPair), filepath.Join(pwd, fsDir))
+	/*
+		pwd, err := os.Getwd()
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+		node := fs.New(new(ecc.KeyPair), new(ecc.KeyPair), filepath.Join(pwd, fsDir))
+	*/
 
 	// TODO: hardcoded test key because this is TEST PROGRAM until this is fixed.
 	if err := node.AddChannel("fixme", pubprivkeyb64Ecc); err != nil {
@@ -177,7 +181,6 @@ func main() {
 	}
 
 	// NOTE: for mipsel32, the optimal byte limit for UDP and TLS were both tested at 250 *1024
-
 	//transportPublic.SetByteLimit(10000 * 1024) // todo this doesn't change the value in the global map
 
 	p2p := policy.NewP2P(transportPublic, listenPublic, node, false, 5, 30000)
@@ -230,7 +233,7 @@ func main() {
 			continue
 		}
 		var n int
-		var batchSize uint32 = 2
+		var batchSize uint32 = 100
 		chunkBatch := make([][]byte, batchSize)
 		for x := range chunkBatch {
 			chunkBatch[x] = make([]byte, chunksize)
@@ -304,7 +307,7 @@ func main() {
 	}
 	for {
 		//runtime.GC()
-		time.Sleep(120 * time.Second)
+		time.Sleep(1 * time.Second)
 
 		//for each stream dir in tmp dir, check for done-ness
 		streamDirs, err := getStreamDirs(tmpDir)
@@ -344,9 +347,9 @@ func main() {
 	}
 }
 
-//func handlerLoop(node *qldb.Node, txDir, rxDir, tmpDir string) {
+//func handlerLoop(node *fs.Node, txDir, rxDir, tmpDir string) {
 
-func handlerLoop(node *fs.Node, txDir, rxDir, tmpDir string) {
+func handlerLoop(node *qldb.Node, txDir, rxDir, tmpDir string) {
 	for {
 
 		skipStreams := make(map[uint32]bool) // streamID's for files we've seen
